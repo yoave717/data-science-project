@@ -1,3 +1,5 @@
+import uuid
+import concurrent
 import pandas as pd
 from datetime import date, timedelta
 import glob
@@ -144,7 +146,7 @@ def extract_number(file_name):
     Returns:
         int: The extracted number if the pattern matches, otherwise 0.
     """
-    match = re.search(r'output_(\d+)_from_(.+)_at_(\d+)_to_(.+)_at_(\d+)', file_name)
+    match = re.search(r'output_(\d+)_from_(.+)_at_(\d+)_to_(.+)_at_(-?\d+)', file_name)
     return int(match.group(1)) if match else 0
 
 def extract_variables(file_name):
@@ -318,3 +320,126 @@ def process_files(folder_path, rows_per_file=10000000):
         save_df_to_parquet(df, file_counter, start_file, start_pos, last_file, -1, files_to_remove, output_files_folder_path)
 
     print(f"Folder size after processing: {get_folder_size(folder_path)} bytes")
+    
+    
+def time_features_extraction(results):
+    """
+    Extracts time-based features from datetime columns in the DataFrame.
+    
+    Parameters:
+    results (pd.DataFrame): DataFrame containing datetime columns to extract features from.
+    
+    Returns:
+    pd.DataFrame: DataFrame with new columns for extracted time features.
+    """
+
+    results['gtfs_start_time__day_of_week'] = results['gtfs_start_time'].dt.dayofweek
+    results['gtfs_start_time__hour'] = results['gtfs_start_time'].dt.hour
+
+    results['gtfs_end_time__day_of_week'] = results['gtfs_end_time'].dt.dayofweek
+    results['gtfs_end_time__hour'] = results['gtfs_end_time'].dt.hour
+
+    results['recorded_at_time__day_of_week'] = results['recorded_at_time'].dt.dayofweek
+    results['recorded_at_time__hour'] = results['recorded_at_time'].dt.hour
+    results['recorded_at_time__minute'] = results['recorded_at_time'].dt.minute
+    results['recorded_at_time__day_of_month'] = results['recorded_at_time'].dt.day
+    results['recorded_at_time__month'] = results['recorded_at_time'].dt.month
+
+    results['estimated_arrival_time__day_of_week'] = results['estimated_arrival_time'].dt.dayofweek
+    results['estimated_arrival_time__hour'] = results['estimated_arrival_time'].dt.hour
+    results['estimated_arrival_time__minute'] = results['estimated_arrival_time'].dt.minute
+    results['estimated_arrival_time__second'] = results['estimated_arrival_time'].dt.second
+    results['estimated_arrival_time__day_of_month'] = results['estimated_arrival_time'].dt.day
+    results['estimated_arrival_time__month'] = results['estimated_arrival_time'].dt.month
+    
+    results['scheduled_arrival_time__day_of_week'] = results['scheduled_arrival_time'].dt.dayofweek
+    results['scheduled_arrival_time__hour'] = results['scheduled_arrival_time'].dt.hour
+    results['scheduled_arrival_time__minute'] = results['scheduled_arrival_time'].dt.minute
+    results['scheduled_arrival_time__second'] = results['scheduled_arrival_time'].dt.second
+    results['scheduled_arrival_time__day_of_month'] = results['scheduled_arrival_time'].dt.day
+    results['scheduled_arrival_time__month'] = results['scheduled_arrival_time'].dt.month
+    
+    return results
+
+
+# Batch Creation Function
+
+# the function `create_batch_df` to create data batches from the large dataset. The function takes the following parameters:
+
+# - `csv_dir`: The directory where the CSV files are stored.
+# - `batch_size_gb`: The maximum size of each batch in gigabytes.
+# - `last_journey_refs`: A set of 'siri_journey_ref' values that were included in the last batch and should be excluded from the current batch.
+# - `start_file`: The file to start reading from. If not specified, reading starts from the first file in the directory.
+# - `start_pos`: The position in the start file to start reading from.
+
+# The function works as follows:
+
+# 1. It initializes an empty DataFrame for the batch and a set to keep track of the 'siri_journey_ref' values in the current batch.
+
+# 2. It iterates over each file in the directory, starting from the `start_file` if specified.
+
+# 3. For each file, it creates an iterator for the chunks in the file and reads the first chunk.
+
+# 4. If there are any `last_journey_refs`, it excludes them from the chunk.
+
+# 5. It then enters a loop where it adds the chunk to the batch if it doesn't exceed the `batch_size_gb`. If the batch size is exceeded, it adds only the rows with the same 'siri_journey_ref' as in the current batch.
+
+# 6. The function returns the batch DataFrame, the set of 'siri_journey_ref' values in the current batch, the next chunk, the iterator for the next chunks, the next file, and the index of the next file.
+
+# By using this function, we can create manageable batches from the large dataset while ensuring that all related lines are included in the same batch.
+
+
+
+def create_batch_df(parquet_dir, batch_size_gb, last_batch_journey_refs=None, start_file=None, start_pos=0):
+    # Convert batch size from GB to bytes
+    batch_size_bytes = batch_size_gb * 1024 * 1024 * 1024
+
+    # Get a list of all output Parquet files
+    parquet_files = glob.glob(f'{parquet_dir}/output_*.parquet')
+    parquet_files.sort(key=extract_number)
+
+    # If a start file is specified, start from this file
+    if start_file is not None:
+        parquet_files = parquet_files[parquet_files.index(start_file):]
+
+    # Initialize an empty DataFrame for the batch
+    batch_df = pd.DataFrame()
+
+    # Initialize a set to keep track of the 'siri_journey_ref' values in the current batch
+    current_journey_refs = set()
+
+    for file in parquet_files:
+        # Create an iterator for the chunks in the Parquet file
+        parquet_file = pq.ParquetFile(file)
+        chunk_iter = parquet_file.iter_batches(batch_size=100000)  # Adjust batch size as needed
+
+        # Read the first chunk and convert it to a DataFrame
+        chunk = pd.DataFrame(next(chunk_iter).to_pandas())
+
+        # If there are any last journey refs, exclude them from the chunk
+        if last_batch_journey_refs is not None:
+            chunk = chunk[~chunk['siri_journey_ref'].isin(last_batch_journey_refs)]
+        while True:
+            # Add the chunk to the batch if it doesn't exceed the batch size
+            if (batch_df.memory_usage(index=True, deep=True).sum() + chunk.memory_usage(index=True, deep=True).sum()) <= batch_size_bytes:
+                batch_df = pd.concat([batch_df, chunk])
+                current_journey_refs.update(chunk['siri_journey_ref'].unique())
+
+            else:
+                # If the batch size is exceeded, add only the rows with the same 'siri_journey_ref' as in the current batch
+                current_journey_refs_in_chunk = chunk['siri_journey_ref'].isin(current_journey_refs)
+                if current_journey_refs_in_chunk.any():
+                    batch_df = pd.concat([batch_df, chunk[current_journey_refs_in_chunk]])
+                    chunk = chunk[~current_journey_refs_in_chunk]
+
+                # Return the current DataFrame and the set of 'siri_journey_ref' values
+                return batch_df, current_journey_refs, chunk, chunk_iter, file, parquet_files.index(file)
+
+            # Try to read the next chunk
+            try:
+                chunk = pd.DataFrame(next(chunk_iter).to_pandas())
+            except StopIteration:
+                break
+
+    # If all files have been processed, return the current DataFrame and the set of 'siri_journey_ref' values
+    return batch_df, current_journey_refs, None, None, None, None
