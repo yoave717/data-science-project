@@ -1,3 +1,6 @@
+import shutil
+import sys
+import time
 import uuid
 import concurrent
 import pandas as pd
@@ -7,6 +10,7 @@ import os
 import re
 import zipfile
 import requests
+from sqlalchemy import text
 
 
 def daterange(start_date, end_date):
@@ -348,16 +352,23 @@ def time_features_extraction(results):
     results['estimated_arrival_time__day_of_week'] = results['estimated_arrival_time'].dt.dayofweek
     results['estimated_arrival_time__hour'] = results['estimated_arrival_time'].dt.hour
     results['estimated_arrival_time__minute'] = results['estimated_arrival_time'].dt.minute
-    results['estimated_arrival_time__second'] = results['estimated_arrival_time'].dt.second
     results['estimated_arrival_time__day_of_month'] = results['estimated_arrival_time'].dt.day
     results['estimated_arrival_time__month'] = results['estimated_arrival_time'].dt.month
     
-    results['scheduled_arrival_time__day_of_week'] = results['scheduled_arrival_time'].dt.dayofweek
-    results['scheduled_arrival_time__hour'] = results['scheduled_arrival_time'].dt.hour
-    results['scheduled_arrival_time__minute'] = results['scheduled_arrival_time'].dt.minute
-    results['scheduled_arrival_time__second'] = results['scheduled_arrival_time'].dt.second
-    results['scheduled_arrival_time__day_of_month'] = results['scheduled_arrival_time'].dt.day
-    results['scheduled_arrival_time__month'] = results['scheduled_arrival_time'].dt.month
+    results['scheduled_arrival_time__day_of_week'] =  results['scheduled_arrival_time'].apply(
+            lambda x: x.dayofweek if pd.notnull(x) else pd.NA)
+    results['scheduled_arrival_time__hour'] = results['scheduled_arrival_time'].apply(
+            lambda x: x.hour if pd.notnull(x) else pd.NA)
+    results['scheduled_arrival_time__minute'] = results['scheduled_arrival_time'].apply(
+            lambda x: x.minute if pd.notnull(x) else pd.NA)
+    results['scheduled_arrival_time__day_of_month'] = results['scheduled_arrival_time'].apply(
+            lambda x: x.day if pd.notnull(x) else pd.NA)
+    results['scheduled_arrival_time__month'] = results['scheduled_arrival_time'].apply(
+            lambda x: x.month if pd.notnull(x) else pd.NA)
+    
+    results['is_weekend'] = results['scheduled_arrival_time__day_of_week'].isin([4, 5]).astype(int)
+    results['is_peak'] = results['scheduled_arrival_time__hour'].isin([5, 6, 8, 9, 13, 14, 15, 16, 17, 18]).astype(int)
+    results['is_nighttime'] = results['scheduled_arrival_time__hour'].isin([0, 1, 2, 3, 4, 22, 23]).astype(int)
     
     return results
 
@@ -443,3 +454,84 @@ def create_batch_df(parquet_dir, batch_size_gb, last_batch_journey_refs=None, st
 
     # If all files have been processed, return the current DataFrame and the set of 'siri_journey_ref' values
     return batch_df, current_journey_refs, None, None, None, None
+
+
+def execute_query(query, engine):
+    """
+    Executes a given SQL query using the provided SQLAlchemy engine.
+
+    Parameters:
+    engine (sqlalchemy.engine.Engine): The SQLAlchemy engine to use for the connection.
+    query (str): The SQL query to execute.
+
+    Returns:
+    None
+
+    Prints:
+    'Query executed successfully.' if the query is executed without errors.
+    An error message if an exception occurs during query execution.
+    """
+    with engine.connect() as conn:
+        try:
+            conn.execute(text(query))
+            print(f'Query executed successfully.')
+        except Exception as e:
+            print(f'An error occurred: {e}')
+            
+
+            
+def execute_query_parallel(query, table_name, engine, batch_size, total_rows):
+    def execute_query_batch(query, table_name, engine, offset, batch_size):
+        query_start = f"""
+        DO
+        $$
+        DECLARE
+            batch_size INT := 25000;
+            inner_offset INT := {offset + 15000000 + 29000000 + 2050000 + 17450000};
+            rows_updated INT := 0;
+            total_rows_updated INT := 0;
+        BEGIN
+            LOOP
+        
+                WITH limited_data AS (
+                    SELECT uuid
+                    FROM {table_name}
+                    WHERE uuid > (
+                        SELECT uuid
+                        FROM {table_name}
+                        ORDER BY uuid
+                        LIMIT 1 OFFSET inner_offset
+                    )
+                    ORDER BY uuid
+                    LIMIT batch_size
+                )
+        """
+        query_end = f"""
+                FROM limited_data
+                WHERE processed_data.uuid = limited_data.uuid;
+                
+                GET DIAGNOSTICS rows_updated = ROW_COUNT;
+                total_rows_updated := total_rows_updated + rows_updated;
+                
+                inner_offset := inner_offset + batch_size;
+                EXIT WHEN inner_offset >= {offset + batch_size + 14000000 + 29000000};
+            END LOOP;
+            
+            RAISE NOTICE 'Total rows updated: %', total_rows_updated;
+        END
+        $$;
+        """
+        altered_query = f"{query_start}{query}{query_end}"
+        
+        start_time = time.time()
+        execute_query(altered_query, engine)
+        end_time = time.time()
+        print(f"Batch starting at offset {offset} executed in {end_time - start_time:.2f} seconds.")
+    
+    
+    
+    offsets = range(0, total_rows, batch_size)
+  
+    with concurrent.futures.ThreadPoolExecutor(14) as executor:
+        executor.map(lambda offset: execute_query_batch(query, table_name, engine, offset, batch_size), offsets)
+        
